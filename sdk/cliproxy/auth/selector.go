@@ -1024,7 +1024,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			return nil, errAvailable
 		}
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+		return s.fallback.Pick(ctx, provider, model, opts, defaultRoutingState.withModelAllowance(fallbackAuths, model, now))
 	}
 
 	// A single availability pass serves both lookups: the bound credential is validated against
@@ -1033,7 +1033,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if err != nil {
 		return nil, err
 	}
-	fallbackAuths := highestPriorityAuths(available)
+	fallbackAuths, allowanceLeft := modelAllowanceRouting(available, model, now)
 
 	modelKey := canonicalModelKey(model)
 	cacheKey := provider + "::" + primaryID + "::" + modelKey
@@ -1057,8 +1057,13 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	}
 
 	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
+		reason := "auth unavailable"
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
+				if !allowanceLeft(auth) {
+					reason = "auth out of its allowance for this model"
+					break
+				}
 				bind(auth.ID)
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 				return auth, nil
@@ -1073,7 +1078,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			return nil, nil
 		}
 		bind(auth.ID)
-		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
+		entry.Infof("session-affinity: cache hit but %s, reselected | session=%s from=%s auth=%s provider=%s model=%s", reason, truncateSessionID(primaryID), cachedAuthID, auth.ID, provider, model)
 		return auth, nil
 	}
 
@@ -1081,7 +1086,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
-					if !isSubagent || s.subagentAffinity {
+					if (!isSubagent || s.subagentAffinity) && allowanceLeft(auth) {
 						bind(auth.ID)
 						if isFork {
 							entry.Infof("session-affinity: fork cache hit | session=%s parent=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
@@ -1111,6 +1116,27 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	return auth, nil
 }
 
+// modelAllowanceRouting applies a model family's own allowance (the weekly
+// Fable allowance) to session routing. available holds the usable credentials
+// of every priority tier.
+//
+// candidates is where a new or moved session may go: the highest tier among
+// the credentials that still have the allowance and that the provider has not
+// recently refused. keeps reports whether a bound credential should keep its
+// session: it does unless it is out of the allowance and a candidate can take
+// over. When no credential is out of the allowance, or none could take over,
+// routing is unchanged: the highest tier, and every binding kept.
+func modelAllowanceRouting(available []*Auth, model string, now time.Time) (candidates []*Auth, keeps func(*Auth) bool) {
+	open, anySpent := defaultRoutingState.modelAllowanceOpen(available, model, now)
+	if !anySpent || len(open) == 0 {
+		return highestPriorityAuths(available), func(*Auth) bool { return true }
+	}
+	return highestPriorityAuths(open), func(auth *Auth) bool {
+		_, spent := defaultRoutingState.modelAllowanceSpent(auth.ID, auth.Provider, model, now)
+		return !spent
+	}
+}
+
 func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth, entry *log.Entry) (*Auth, bool, error) {
 	if s == nil || s.matcher == nil {
 		return nil, false, nil
@@ -1138,15 +1164,21 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 	if _, weighted := s.fallback.(*WeightedRoundRobinSelector); weighted {
 		availabilityCandidates = positiveWeightAuths(auths)
 	}
-	available, errAvailable := getSelectorAvailableAuthsAcrossPriorities(ctx, availabilityCandidates, provider, model, time.Now())
+	now := time.Now()
+	available, errAvailable := getSelectorAvailableAuthsAcrossPriorities(ctx, availabilityCandidates, provider, model, now)
 	if errAvailable != nil {
 		return nil, true, errAvailable
 	}
+	fallbackAuths, allowanceLeft := modelAllowanceRouting(available, model, now)
 
 	if match, ok := s.matcher.MatchFingerprintsWithContext(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength); ok {
 		for _, auth := range available {
 			if auth == nil || auth.ID != match.AuthID {
 				continue
+			}
+			if !allowanceLeft(auth) {
+				entry.Infof("session-affinity: LCP hit but auth out of its allowance for this model, reselecting | session=%s from=%s provider=%s model=%s", truncateSessionID(match.SessionID), auth.ID, provider, model)
+				break
 			}
 			if match.SessionID != "" {
 				opts.Metadata[cliproxyexecutor.LCPAffinitySessionIDMetadataKey] = match.SessionID
@@ -1186,7 +1218,6 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 		}
 	}
 
-	fallbackAuths := highestPriorityAuths(available)
 	auth, errPick := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
 	if errPick != nil {
 		return nil, true, errPick

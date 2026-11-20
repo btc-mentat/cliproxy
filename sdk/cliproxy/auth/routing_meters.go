@@ -234,8 +234,17 @@ func meterIsShort(meter *Meter) bool {
 // claudeModelFamilies are the model families Anthropic may meter separately.
 var claudeModelFamilies = []string{"fable", "opus", "sonnet", "haiku"}
 
+// claudeFableClaim is the claim Anthropic's rate-limit headers use for the
+// weekly Fable allowance ("seven_day_overage_included" in its usage report,
+// "Fable limit" in Claude Code). Only Fable responses carry it.
+const claudeFableClaim = "7d_oi"
+
 func claudeModelFamily(model string) string {
 	lower := strings.ToLower(model)
+	// Mythos is the same model as Fable and draws on the same allowance.
+	if strings.Contains(lower, "mythos") {
+		return "fable"
+	}
 	for _, family := range claudeModelFamilies {
 		if strings.Contains(lower, family) {
 			return family
@@ -244,11 +253,22 @@ func claudeModelFamily(model string) string {
 	return ""
 }
 
+// claudeClaimFamily returns the model family a claim meters on its own, or ""
+// for a claim that is not tied to one family by name.
+func claudeClaimFamily(claim string) string {
+	if strings.EqualFold(claim, claudeFableClaim) {
+		return "fable"
+	}
+	return claudeModelFamily(claim)
+}
+
 // meterAppliesToModel reports whether a request for model draws on meter.
 //
 // Claude's plain "5h" and "7d" claims cover every model. A claim that names a
-// model family ("7d_opus") covers that family only. Any other claim covers
-// the models whose responses reported it, or every model before one has.
+// model family ("7d_opus") covers that family only. The Fable claim covers
+// Fable requests only, so a spent Fable week never holds back other models or
+// a ranking that names no model. Any other claim covers the models whose
+// responses reported it, or every model before one has.
 // Codex's plain primary and secondary windows cover every model; its named
 // additional limits are shown but not applied, because the headers do not say
 // which models they cover.
@@ -261,10 +281,11 @@ func meterAppliesToModel(provider string, meter *Meter, model string) bool {
 		if meter.Name == "5h" || meter.Name == "7d" {
 			return true
 		}
-		for _, family := range claudeModelFamilies {
-			if strings.Contains(meter.Name, family) {
-				return model == "" || claudeModelFamily(model) == family
-			}
+		if strings.EqualFold(meter.Name, claudeFableClaim) {
+			return claudeModelFamily(model) == "fable"
+		}
+		if family := claudeClaimFamily(meter.Name); family != "" {
+			return model == "" || claudeModelFamily(model) == family
 		}
 		if len(meter.Models) == 0 || model == "" {
 			return true
@@ -281,6 +302,95 @@ func meterAppliesToModel(provider string, meter *Meter, model string) bool {
 	default:
 		return false
 	}
+}
+
+// meterSpent reports whether the meter, as it stands at now, has no allowance
+// left: the provider rejected the window or it is at fullMeterUtilization, and
+// its reset is still ahead.
+func meterSpent(meter Meter, now time.Time) (Meter, bool) {
+	effective, wasReset := effectiveMeter(meter, now)
+	if wasReset || !effective.ResetAt.After(now) {
+		return effective, false
+	}
+	return effective, strings.EqualFold(effective.Status, "rejected") || effective.Utilization >= fullMeterUtilization
+}
+
+// modelAllowanceSpent reports whether the credential has used up an allowance
+// that only the requested model's family draws on, such as the weekly Fable
+// allowance or a "7d_opus" week, and when that allowance resets. The shared
+// 5-hour and weekly windows are not looked at: the provider's own refusal and
+// the cooldown it starts already move work off a credential that is out of
+// those.
+func (s *RoutingState) modelAllowanceSpent(authID, provider, model string, now time.Time) (Meter, bool) {
+	family := claudeModelFamily(model)
+	if s == nil || family == "" || !strings.EqualFold(strings.TrimSpace(provider), "claude") {
+		return Meter{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return familyAllowanceSpent(s.accounts[authID], family, now)
+}
+
+func familyAllowanceSpent(account *accountRouting, family string, now time.Time) (Meter, bool) {
+	if account == nil {
+		return Meter{}, false
+	}
+	for _, meter := range account.Meters {
+		if meter == nil || claudeClaimFamily(meter.Name) != family {
+			continue
+		}
+		if effective, spent := meterSpent(*meter, now); spent {
+			return effective, true
+		}
+	}
+	return Meter{}, false
+}
+
+// modelAllowanceOpen returns the candidates that can take a session of model
+// from a credential that has used up the model family's own allowance: those
+// that still have that allowance and that the provider has not recently
+// refused. anySpent reports whether any candidate is out of the allowance.
+func (s *RoutingState) modelAllowanceOpen(auths []*Auth, model string, now time.Time) (open []*Auth, anySpent bool) {
+	family := claudeModelFamily(model)
+	if s == nil || family == "" {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, candidate := range auths {
+		if candidate == nil {
+			continue
+		}
+		account := s.accounts[candidate.ID]
+		if strings.EqualFold(strings.TrimSpace(candidate.Provider), "claude") {
+			if _, spent := familyAllowanceSpent(account, family, now); spent {
+				anySpent = true
+				continue
+			}
+		}
+		if account != nil {
+			if _, refused := account.Health.refusedReason(now); refused {
+				continue
+			}
+		}
+		open = append(open, candidate)
+	}
+	return open, anySpent
+}
+
+// withModelAllowance narrows candidates to the ones modelAllowanceOpen returns
+// when some candidate is out of the model family's own allowance. When none
+// is, or when no candidate could take the work, the list is returned
+// unchanged, so routing never fails closed on the router's own data.
+func (s *RoutingState) withModelAllowance(auths []*Auth, model string, now time.Time) []*Auth {
+	if len(auths) < 2 {
+		return auths
+	}
+	open, anySpent := s.modelAllowanceOpen(auths, model, now)
+	if !anySpent || len(open) == 0 {
+		return auths
+	}
+	return open
 }
 
 // effectiveMeter returns the meter as it stands at now: a window whose reset
