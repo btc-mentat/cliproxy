@@ -140,7 +140,12 @@ func TestReauthKeepsOtherClaudeFiles(t *testing.T) {
 	if err := h.bindReauthRecord(target.ID, record); err != nil {
 		t.Fatal(err)
 	}
-	saved, err := h.persistTokenRecord(context.Background(), record, false)
+	var runtimeID string
+	h.SetPostAuthPersistHook(func(_ context.Context, a *coreauth.Auth) error { runtimeID = a.ID; return nil })
+	saved, err := h.persistTokenRecord(context.Background(), record, true)
+	if runtimeID != target.ID {
+		t.Fatalf("runtime updated %q, want %q", runtimeID, target.ID)
+	}
 	if err != nil || saved != selected {
 		t.Fatalf("saved %q, err %v", saved, err)
 	}

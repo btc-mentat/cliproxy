@@ -969,10 +969,10 @@ func (h *Handler) mergeExistingAuthFileMetadata(record *coreauth.Auth) {
 }
 
 func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (string, error) {
-	return h.persistTokenRecord(ctx, record, true)
+	return h.persistTokenRecord(ctx, record, false)
 }
 
-func (h *Handler) persistTokenRecord(ctx context.Context, record *coreauth.Auth, migrateLegacyClaude bool) (string, error) {
+func (h *Handler) persistTokenRecord(ctx context.Context, record *coreauth.Auth, reauth bool) (string, error) {
 	if record == nil {
 		return "", fmt.Errorf("token record is nil")
 	}
@@ -982,7 +982,7 @@ func (h *Handler) persistTokenRecord(ctx context.Context, record *coreauth.Auth,
 		return "", fmt.Errorf("token store unavailable")
 	}
 	var legacyClaudeCredential *coreauth.Auth
-	if migrateLegacyClaude {
+	if !reauth {
 		var errLegacy error
 		legacyClaudeCredential, errLegacy = claudeauth.FindMatchingLegacyCredential(ctx, store, record)
 		if errLegacy != nil {
@@ -1017,9 +1017,13 @@ func (h *Handler) persistTokenRecord(ctx context.Context, record *coreauth.Auth,
 	if h.postAuthPersistHook != nil {
 		persistedRecord := record
 		if data, errRead := os.ReadFile(savedPath); errRead == nil && len(data) > 0 {
+			authDir := filepath.Dir(savedPath)
+			if reauth {
+				authDir = h.cfg.AuthDir
+			}
 			auths, errSynthesize := synthesizer.SynthesizeAuthFile(&synthesizer.SynthesisContext{
 				Config:           h.cfg,
-				AuthDir:          filepath.Dir(savedPath),
+				AuthDir:          authDir,
 				Now:              time.Now(),
 				IDGenerator:      synthesizer.NewStableIDGenerator(),
 				PluginAuthParser: h.pluginHost,
@@ -1028,7 +1032,7 @@ func (h *Handler) persistTokenRecord(ctx context.Context, record *coreauth.Auth,
 				return savedPath, fmt.Errorf("synthesize persisted auth failed: %w", errSynthesize)
 			}
 			for _, auth := range auths {
-				if auth != nil && (auth.ID == record.ID || len(auths) == 1) {
+				if auth != nil && (auth.ID == record.ID || (!reauth && len(auths) == 1)) {
 					persistedRecord = auth
 					break
 				}
