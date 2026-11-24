@@ -92,6 +92,7 @@ func (s *Service) readClaudeUsage(ctx context.Context, auth *coreauth.Auth) erro
 	state := coreauth.DefaultRoutingState()
 	now := time.Now()
 	if meters := coreauth.ParseClaudeUsageMeters(body, now); len(meters) > 0 {
+		s.releaseRefilledHold(ctx, auth, meters, now)
 		state.ObserveMeters(auth.ID, "claude", meters, now)
 	}
 	state.ObserveResets(auth.ID, "claude", coreauth.ParseClaudeResetStatus(body, now))
@@ -134,6 +135,38 @@ func (s *Service) claimClaudeReset(ctx context.Context, auth *coreauth.Auth, gra
 		return true
 	})
 	return result, nil
+}
+
+// releaseRefilledHold releases the hold on an account whose usage report
+// shows a window refilled before the time the proxy holds it until, as happens
+// when a reset is used at the provider.
+//
+// A request that finishes on the account while the report is being fetched
+// changes the account, and the release is refused for a snapshot that is out
+// of date. It is tried again with the account as it stands now. If that is
+// refused too, the report is still recorded by the caller: the meters keep
+// the refill, so the next read releases the hold.
+func (s *Service) releaseRefilledHold(ctx context.Context, auth *coreauth.Auth, meters map[string]*coreauth.Meter, now time.Time) {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	reopened := coreauth.DefaultRoutingState().ReopenedClaudeWindows(auth.ID, meters, now)
+	if len(reopened) == 0 {
+		return
+	}
+	current := auth
+	var errReconcile error
+	for attempt := 0; attempt < 2; attempt++ {
+		if errReconcile = s.coreManager.ReconcileClaudeQuota(ctx, current, reopened, meters); errReconcile == nil {
+			return
+		}
+		fresh, ok := s.coreManager.GetByID(auth.ID)
+		if !ok || fresh == nil {
+			break
+		}
+		current = fresh
+	}
+	log.WithField("auth", auth.ID).Debugf("usage read: hold not released, left for the next read: %v", errReconcile)
 }
 
 func codexOAuth(auth *coreauth.Auth) (token, accountID string) {
@@ -186,6 +219,7 @@ func (s *Service) readCodexUsage(ctx context.Context, auth *coreauth.Auth) error
 		return fmt.Errorf("read usage windows: %w", errUsage)
 	}
 	if meters := coreauth.ParseCodexUsageMeters(usage, now); len(meters) > 0 {
+		s.releaseRefilledHold(ctx, auth, meters, now)
 		state.ObserveMeters(auth.ID, "codex", meters, now)
 	}
 	return nil
@@ -249,7 +283,14 @@ func (s *Service) probeCodexResets(ctx context.Context) {
 		if token, accountID := codexOAuth(auth); token == "" || accountID == "" {
 			continue
 		}
-		if !state.NeedsResetReading(auth.ID, time.Now(), meterProbeMaxAge) {
+		now := time.Now()
+		resetAge := meterProbeMaxAge
+		if codexAccountHeld(auth, now) {
+			// A reset used at the provider refills an account days before the
+			// time it is held until, so a held account is read more often.
+			resetAge = heldAccountProbeAge
+		}
+		if !state.NeedsResetReading(auth.ID, now, resetAge) {
 			continue
 		}
 		if errRead := s.readCodexUsage(ctx, auth); errRead != nil {
@@ -257,6 +298,24 @@ func (s *Service) probeCodexResets(ctx context.Context) {
 		}
 		state.MarkResetProbe(auth.ID, time.Now())
 	}
+}
+
+// heldAccountProbeAge is how often an account held for a used-up limit is
+// read again, so a refill at the provider is noticed within a few minutes.
+const heldAccountProbeAge = 2 * meterProbeInterval
+
+// codexAccountHeld reports whether the account, or any of its models, is held
+// for a used-up limit. Codex limits are held per model.
+func codexAccountHeld(auth *coreauth.Auth, now time.Time) bool {
+	if auth.Quota.Exceeded && auth.Quota.NextRecoverAt.After(now) {
+		return true
+	}
+	for _, state := range auth.ModelStates {
+		if state != nil && state.Quota.Exceeded && state.Quota.NextRecoverAt.After(now) {
+			return true
+		}
+	}
+	return false
 }
 
 // runAutoReset uses one reset when automatic mode is on and one is worth it.
