@@ -3,6 +3,7 @@ package management
 import (
 	"errors"
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -95,10 +96,21 @@ func (h *Handler) bindReauthRecord(id string, record *coreauth.Auth) error {
 		}
 	}
 	// Older files may have only the generated filename to identify their workspace.
-	if !sameWorkspace && !strings.EqualFold(target.FileName, record.FileName) {
+	if !sameWorkspace && !strings.EqualFold(filepath.Base(target.FileName), record.FileName) {
 		return errors.New("The provider could not confirm the original workspace. Check the account and try again.")
 	}
-	record.ID, record.FileName = target.ID, target.FileName
+	fileName := target.FileName
+	if path := target.Attributes["path"]; path != "" {
+		relative, err := filepath.Rel(h.cfg.AuthDir, path)
+		if err != nil || !filepath.IsLocal(relative) {
+			return errors.New("The selected credential is outside the accounts directory.")
+		}
+		fileName = relative
+	}
+	if !filepath.IsLocal(fileName) {
+		return errors.New("The selected credential has no local account file.")
+	}
+	record.ID, record.FileName = target.ID, fileName
 	return nil
 }
 

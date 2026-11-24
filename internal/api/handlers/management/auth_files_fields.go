@@ -969,6 +969,10 @@ func (h *Handler) mergeExistingAuthFileMetadata(record *coreauth.Auth) {
 }
 
 func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (string, error) {
+	return h.persistTokenRecord(ctx, record, true)
+}
+
+func (h *Handler) persistTokenRecord(ctx context.Context, record *coreauth.Auth, migrateLegacyClaude bool) (string, error) {
 	if record == nil {
 		return "", fmt.Errorf("token record is nil")
 	}
@@ -977,13 +981,18 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	if store == nil {
 		return "", fmt.Errorf("token store unavailable")
 	}
-	legacyClaudeCredential, errLegacy := claudeauth.FindMatchingLegacyCredential(ctx, store, record)
-	if errLegacy != nil {
-		return "", errLegacy
+	var legacyClaudeCredential *coreauth.Auth
+	if migrateLegacyClaude {
+		var errLegacy error
+		legacyClaudeCredential, errLegacy = claudeauth.FindMatchingLegacyCredential(ctx, store, record)
+		if errLegacy != nil {
+			return "", errLegacy
+		}
+		if legacyClaudeCredential != nil {
+			coreauth.MergeExistingAuthMetadata(record, legacyClaudeCredential.Metadata)
+		}
 	}
-	if legacyClaudeCredential != nil {
-		coreauth.MergeExistingAuthMetadata(record, legacyClaudeCredential.Metadata)
-	}
+
 	if h.postAuthHook != nil {
 		if err := h.postAuthHook(ctx, record); err != nil {
 			return "", fmt.Errorf("post-auth hook failed: %w", err)

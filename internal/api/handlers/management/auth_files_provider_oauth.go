@@ -182,7 +182,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 			SetOAuthSessionError(state, errTarget.Error())
 			return
 		}
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		savedPath, errSave := h.persistTokenRecord(ctx, record, targetID == "")
 		if errSave != nil {
 			log.Errorf("Failed to save authentication tokens: %v", errSave)
 			SetOAuthSessionError(state, "Failed to save authentication tokens")
@@ -349,7 +349,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 			SetOAuthSessionError(state, errTarget.Error())
 			return
 		}
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		savedPath, errSave := h.persistTokenRecord(ctx, record, targetID == "")
 		if errSave != nil {
 			SetOAuthSessionError(state, "Failed to save authentication tokens")
 			log.Errorf("Failed to save authentication tokens: %v", errSave)

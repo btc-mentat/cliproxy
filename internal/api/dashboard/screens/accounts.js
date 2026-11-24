@@ -13,7 +13,10 @@ function nextIds() {
 export function accountBadge(a, next) {
   const st = status(a);
   if (st.kind === "blocked" || st.kind === "error") {
-    if (a.can_reauthenticate) return `<button class="btn outline" data-reauth="${esc(a.id)}" title="${esc(st.detail || st.text)}" aria-label="Sign in again as ${esc(a.email)}">${warnIcon(14)}Sign in again</button>`;
+    if (a.can_reauthenticate) {
+      const reason = st.kind === "error" && st.text !== "Error" ? warnState(st.text) : "";
+      return `${reason}<button class="btn outline" data-reauth="${esc(a.id)}" title="${esc(st.detail || st.text)}" aria-label="Sign in again as ${esc(a.email)}">${warnIcon(14)}Sign in again</button>`;
+    }
     return warnState(st.text);
   }
   if (next.has(a.id)) return pill("Next");

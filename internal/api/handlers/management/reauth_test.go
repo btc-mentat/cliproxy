@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"testing"
 
@@ -108,5 +109,49 @@ func TestReauthCallbackUpdatesOnlySelectedRow(t *testing.T) {
 	files, err := filepath.Glob(filepath.Join(dir, "*.json"))
 	if err != nil || len(files) != 1 {
 		t.Fatal("sign-in created another row", files)
+	}
+}
+
+func TestReauthKeepsOtherClaudeFiles(t *testing.T) {
+	dir := t.TempDir()
+	canonical := claude.CredentialFileName("user@example.test", "org", "account")
+	sibling := filepath.Join(dir, canonical)
+	legacy := filepath.Join(dir, "claude-user@example.test.json")
+	selected := filepath.Join(dir, "saved", canonical)
+	if err := os.Mkdir(filepath.Dir(selected), 0700); err != nil {
+		t.Fatal(err)
+	}
+	original := []byte(`{"type":"claude","email":"user@example.test","organization_uuid":"org","account_uuid":"account","refresh_token":"old","priority":-1}`)
+	for _, p := range []string{sibling, legacy, selected} {
+		if err := os.WriteFile(p, original, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := coreauth.NewManager(nil, nil, nil)
+	target := &coreauth.Auth{ID: "saved/" + canonical, FileName: canonical, Provider: "claude", Attributes: map[string]string{"path": selected}}
+	if err := json.Unmarshal(original, &target.Metadata); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Register(context.Background(), target); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: dir}, m)
+	record := &coreauth.Auth{ID: canonical, FileName: canonical, Provider: "claude", Metadata: map[string]any{"email": "user@example.test", "organization_uuid": "org", "account_uuid": "account", "refresh_token": "replacement", "type": "claude"}}
+	if err := h.bindReauthRecord(target.ID, record); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := h.persistTokenRecord(context.Background(), record, false)
+	if err != nil || saved != selected {
+		t.Fatalf("saved %q, err %v", saved, err)
+	}
+	for _, p := range []string{sibling, legacy} {
+		b, err := os.ReadFile(p)
+		if err != nil || string(b) != string(original) {
+			t.Fatal("changed sibling credential", p)
+		}
+	}
+	b, err := os.ReadFile(selected)
+	if err != nil || !strings.Contains(string(b), "replacement") {
+		t.Fatal("selected row was not updated")
 	}
 }
